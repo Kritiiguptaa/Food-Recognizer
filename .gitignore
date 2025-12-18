@@ -1,4 +1,5 @@
-# Python artifacts
+# Ignore oversized model file to allow pushing code
+cuisines/South Indian Cuisines/models/best_convnext_tiny.pth# Python artifacts
 __pycache__/
 *.py[cod]
 *.pyo
