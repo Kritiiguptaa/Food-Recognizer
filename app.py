@@ -1,42 +1,23 @@
-# app.py — Predict BOTH cuisines
+# app.py — Fixed TTA at 7 (No Slider)
 
 from pathlib import Path
-import io, glob, difflib, random
-import torch, torch.nn as nn
+import io
+import torch
+import torch.nn as nn
 from PIL import Image
 import pandas as pd
 import streamlit as st
 from torchvision import transforms
-from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+from nutrition import nutrition_for_dish  
 
 st.set_page_config(page_title="Indian Food Recognizer", page_icon="🍽️", layout="wide")
-st.title("🍽️ Indian Food Recognizer")
-st.caption("Upload an image → Get predictions from both Punjabi & South Indian models.")
 
-# ------------------------------------------------------------------
-# Paths
-# ------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent
 CUISINE_ROOT = ROOT / "cuisines"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Expected folder structure:
-# cuisines/
-#   Punjabi/
-#     model/best_efficientnet_b0.pth
-#     model/classes.txt
-#     recipes.xlsx
-#     data/Punjabi_Split_Data/...
-#   SouthIndian/
-#     model/best_efficientnet_b0.pth
-#     model/classes.txt
-#     recipes.xlsx
-#     data/SouthIndian_Split_Data/...
 
-# ------------------------------------------------------------------
-# Helper functions
-# ------------------------------------------------------------------
-def _norm(s: str) -> str:
+def _norm(s):
     return "".join(ch for ch in str(s).lower().strip() if ch.isalnum() or ch.isspace())
 
 @st.cache_resource
@@ -44,10 +25,19 @@ def load_classes(path):
     return [line.strip() for line in open(path, "r", encoding="utf-8")]
 
 @st.cache_resource
-def load_model(path, num_classes: int):
-    m = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
-    m.classifier[1] = nn.Linear(m.classifier[1].in_features, num_classes)
-    m.load_state_dict(torch.load(path, map_location=device))
+def load_model(path, num_classes):
+    path = str(path)
+    if "b3" in path.lower():
+        from torchvision.models import efficientnet_b3, EfficientNet_B3_Weights
+        m = efficientnet_b3(weights=EfficientNet_B3_Weights.IMAGENET1K_V1)
+        m.classifier[1] = nn.Linear(m.classifier[1].in_features, num_classes)
+    else:
+        from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+        m = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
+        m.classifier[1] = nn.Linear(m.classifier[1].in_features, num_classes)
+
+    state = torch.load(path, map_location=device)
+    m.load_state_dict(state)
     m.to(device).eval()
     return m
 
@@ -66,115 +56,147 @@ TFM = transforms.Compose([
 @torch.no_grad()
 def predict(img, model, classes, tta=3):
     x = TFM(img.convert("RGB")).unsqueeze(0).to(device)
-
-    logits = 0
-    for i in range(tta):
-        logits += model(torch.flip(x, dims=[3]) if i % 2 else x)
-
+    logits = sum(model(torch.flip(x, dims=[3]) if i % 2 else x) for i in range(tta))
     probs = (logits / tta).softmax(1).squeeze(0)
     p, idx = probs.topk(5)
-
-    return [(classes[i], float(pp)) for pp, i in zip(p.tolist(), idx.tolist())]
+    return [(classes[i], float(pp)) for pp, i in zip(p, idx)]
 
 def lookup_recipe(name, df):
     key = _norm(name)
-    for recipe in df["Recipe Name"]:
-        if _norm(recipe) == key:
-            return df[df["Recipe Name"] == recipe].iloc[0].to_dict()
+  
+    for r in df["Recipe Name"]:
+        if _norm(r) == key:
+            return df[df["Recipe Name"] == r].iloc[0].to_dict()
+ 
+    for r in df["Recipe Name"]:
+        if key in _norm(r):
+            return df[df["Recipe Name"] == r].iloc[0].to_dict()
     return None
 
-# ------------------------------------------------------------------
-# Load BOTH cuisines
-# ------------------------------------------------------------------
-def load_cuisine(cuisine_name):
-    C = CUISINE_ROOT / cuisine_name
-    model = load_model(C / "models" / "best_efficientnet_b0.pth",
-                       len(load_classes(C / "models" / "classes.txt")))
-    
+
+def load_cuisine(folder):
+    path = CUISINE_ROOT / folder
+    classes = load_classes(path / "models" / "classes.txt")
+    num_c = len(classes)
+    if "South" in folder:
+        model_path = path / "models" / "best_b3.pth"
+    else:
+        model_path = path / "models" / "best_efficientnet_b0.pth"
+
     return {
-        "name": cuisine_name,
-        "model": model,
-        "classes": load_classes(C / "models" / "classes.txt"),
-        "recipes": load_excel(C / "recipes.xlsx"),
-        "data_root": C / "data"
+        "model": load_model(model_path, num_c),
+        "classes": classes,
+        "recipes": load_excel(path / "recipes.xlsx")
     }
 
-ALL_CUISINES = {
+ALL = {
     "Punjabi": load_cuisine("Punjabi Cuisines"),
     "South Indian": load_cuisine("South Indian Cuisines")
 }
 
-# ------------------------------------------------------------------
-# Main UI
-# ------------------------------------------------------------------
-colL, colR = st.columns([1, 1])
-uploaded = colL.file_uploader("Upload Image", type=["jpg", "jpeg", "png"])
-cam = colR.camera_input("Take Photo")
 
-tta = st.slider("Prediction averaging (TTA)", 1, 7, 3)
+st.title("🍽️ Indian Food Recognizer")
+st.markdown("Upload a photo of Indian food to identify the dish, get the recipe, and see nutrition info.")
 
-# ------------------------------------------------------------------
-# Run predictions
-# ------------------------------------------------------------------
-if uploaded or cam:
-    file = cam if cam else uploaded
+col1, col2 = st.columns(2)
+uploaded = col1.file_uploader("Upload Image", type=["jpg", "png", "jpeg"])
+camera = col2.camera_input("Take Photo")
+
+
+tta = 7  
+
+if uploaded or camera:
+    file = camera if camera else uploaded
     img = Image.open(io.BytesIO(file.getvalue()))
+    
+    
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        st.image(img, use_container_width=True, caption="Your Food")
 
-    # Display smaller image
-    st.image(img, caption="Input Image", use_column_width=False, width=350)
+    
+    res = {}
+    
+    with st.spinner("Analyzing flavors (high accuracy mode)..."):
+        for cname, C in ALL.items():
+            res[cname] = predict(img, C["model"], C["classes"], tta)
 
-    results = {}
+    best_cuisine = max(res, key=lambda c: res[c][0][1])
+    top5 = res[best_cuisine]
+    best_dish = top5[0][0]
 
-    # Predict for each cuisine
-    for cname, C in ALL_CUISINES.items():
-        top5 = predict(img, C["model"], C["classes"], tta=tta)
-        results[cname] = top5
+   
+    st.divider()
+    
+   
+    st.markdown(f"<h2 style='text-align: center;'>👉 It looks like: <b>{best_dish}</b></h2>", unsafe_allow_html=True)
+    st.markdown(f"<p style='text-align: center; color: gray;'>Cuisine: {best_cuisine}</p>", unsafe_allow_html=True)
 
-    # Display results side-by-side
-    # st.markdown("## 🔍 Predictions from both cuisines")
+   
+    with st.expander("See other possibilities"):
+        st.table(pd.DataFrame(top5, columns=["Dish Name", "Confidence Score"]))
 
-        # ------------------------------------------------------------------
-    # Decide cuisine automatically
-    # ------------------------------------------------------------------
+    
+    C = ALL[best_cuisine]
+    recipe = lookup_recipe(best_dish, C["recipes"])
 
-    south_top5 = results["South Indian"]
-    punjabi_top5 = results["Punjabi"]
+    if recipe:
+        st.markdown("### 📘 Recipe Card")
+        
+       
+        m1, m2, m3 = st.columns(3)
+        time_val = recipe.get("Total Time", recipe.get("Total TimeInMinutes", "N/A"))
+        m1.metric("⏱️ Total Time", f"{time_val} min" if str(time_val).isdigit() else str(time_val))
+        m2.metric("🥘 Course", recipe.get("Course", "Main Dish"))
+        m3.metric("🌶️ Diet", recipe.get("Diet", "Vegetarian"))
 
-    best_south = south_top5[0][1]   # confidence
-    best_punjabi = punjabi_top5[0][1]
+        st.markdown("") # Spacer
 
-    if best_south >= best_punjabi:
-        final_cuisine = "South Indian"
-        final_preds = south_top5
+        # 2. Ingredients & Instructions Columns
+        col_ing, col_inst = st.columns([1, 1.5]) # Left narrow, Right wide
+
+        with col_ing:
+            st.info("**🛒 Ingredients**")
+            # Split comma-separated ingredients into a list
+            raw_ing = str(recipe.get("Ingredients", ""))
+            ingredients = [x.strip() for x in raw_ing.split(',') if x.strip()]
+            
+            for ing in ingredients:
+                st.markdown(f"• {ing}")
+
+        with col_inst:
+            st.success("**👩‍🍳 Instructions**")
+            # Split paragraph text into sentences based on '.'
+            raw_inst = str(recipe.get("Instructions", ""))
+            steps = [s.strip() for s in raw_inst.split('.') if len(s.strip()) > 5]
+            
+            for i, step in enumerate(steps, 1):
+                st.markdown(f"**{i}.** {step}.")
+
+        # 3. Nutrition Section
+        st.divider()
+        st.subheader("🥗 Nutrition Facts (Estimated)")
+        
+        cleaned = recipe.get("Cleaned-Ingredients", "") or recipe.get("Ingredients", "")
+        ing_list = [i.strip() for i in str(cleaned).split(",") if i.strip()]
+
+        with st.spinner("Fetching USDA data..."):
+            nut, source = nutrition_for_dish(best_dish, ing_list)
+
+        if nut:
+            st.caption(f"Source: {source}")
+            n1, n2, n3, n4 = st.columns(4)
+            n1.metric("🔥 Calories", f"{nut['calories']} kcal")
+            n2.metric("💪 Protein", f"{nut['protein']} g")
+            n3.metric("🥑 Fat", f"{nut['fat']} g")
+            n4.metric("🍬 Sugar", f"{nut['sugar']} g")
+        else:
+            st.warning("Could not calculate nutrition for this dish.")
+
+        # Link
+        url = recipe.get("URL") or recipe.get("Link to recipe")
+        if url:
+            st.markdown(f"[🔗 **View Original Recipe on Archana's Kitchen**]({url})")
+
     else:
-        final_cuisine = "Punjabi"
-        final_preds = punjabi_top5
-
-    # ------------------------------------------------------------------
-    # Show only the detected cuisine
-    # ------------------------------------------------------------------
-
-    st.markdown(f"## 🍽 Predicted Cuisine: **{final_cuisine}**")
-
-    st.table(pd.DataFrame(final_preds, columns=["Dish", "Confidence"]))
-
-    top1_name = final_preds[0][0]
-
-    # ------------------------------------------------------------------
-    # Recipe Details
-    # ------------------------------------------------------------------
-
-    st.markdown("## 📘 Recipe Details")
-
-    Cbest = ALL_CUISINES[final_cuisine]
-    recipe_df = Cbest["recipes"]
-
-    info = lookup_recipe(top1_name, recipe_df)
-
-    st.markdown(f"### Best match: **{top1_name}**")
-
-    if info:
-        for k, v in info.items():
-            st.write(f"**{k}:** {v if v not in ['', None] else '-'}")
-    else:
-        st.info("No recipe found in the dataset.")
+        st.error(f"Recipe details for '{best_dish}' not found in the database.")
